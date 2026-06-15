@@ -28,9 +28,11 @@ class Deck:
         random.shuffle(self.cards, seed=self._rng)
 
     def reset(self, seed: int | None = None) -> None:
-        """Rebuild and shuffle the deck; optionally re-seed the RNG."""
-        raise 
-
+        """Rebuild and shuffle the deck."""
+        self._build()
+        self._rng = seed
+        self.shuffle()
+        
     # ------------------------------------------------------------------
     # Dealing
     # ------------------------------------------------------------------
@@ -42,14 +44,28 @@ class Deck:
         Each hand is sorted by suit then rank for readability.
         Raises ValueError if 52 % num_players != 0.
         """
+        dealt_hands = [[] for i in range(num_players)]
+        player = 0
+        if 52 % num_players != 0:
+            raise ValueError
+        ctr = 0
+        while ctr != 52:
+            dealt_hands[player].append(self.cards[ctr])
+            ctr += 1
+            player = (player + 1) % 4
         
+        # sort the cards in each deck
+        for player in range(num_players):
+            dealt_hands[player].sort(key=Card.beats, reverse=True)
+           
+            
 
-    def deal_hand(self, n: int = 13) -> List[Card]:
-        """
-        Draw and return the next `n` cards from the deck.
-        Raises IndexError if not enough cards remain.
-        """
-        raise NotImplementedError
+    # def deal_hand(self, n: int = 13) -> List[Card]:
+    #     """
+    #     Draw and return the next `n` cards from the deck.
+    #     Raises IndexError if not enough cards remain.
+    #     """
+    #     raise NotImplementedError
 
     # ------------------------------------------------------------------
     # Utility

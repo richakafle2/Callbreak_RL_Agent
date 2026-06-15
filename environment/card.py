@@ -51,7 +51,7 @@ class Card:
     @property
     def is_trump(self) -> bool:
         """Return True if this card is a spade (trump suit)."""
-        raise NotImplementedError
+        return self.suit == 3
 
     @property
     def index(self) -> int:
@@ -60,13 +60,13 @@ class Card:
         Convention: index = suit * 13 + (rank - 2)
         Used for tensor encoding.
         """
-        raise NotImplementedError
+        return self.suit * 13 + (self.rank - 2)
 
     # ------------------------------------------------------------------
     # Comparison helpers
     # ------------------------------------------------------------------
 
-    def beats(self, other: "Card", led_suit: Suit) -> bool:
+    def beats(self, other: Card, led_suit: Suit) -> bool:
         """
         Return True if this card beats `other` given the led suit.
         Rules:
@@ -74,7 +74,24 @@ class Card:
           - Same suit: higher rank wins.
           - Non-trump, different suit from led: loses to led suit cards.
         """
-        raise NotImplementedError
+        # other card is a spade so this card must be a spade to beat
+        if other.suit == 3:
+            if self.suit == 3:
+                return self.rank > other.rank
+            else: 
+                return False
+
+        # other card is the lead suit 
+        if other.suit == led_suit:
+            if self.suit == led_suit:
+                return self.rank > other.rank
+            else: 
+                return False
+            
+        # default, but should never come to this is where both are not lead or spade so just return higher rank
+        
+        return self.rank > other.rank
+    
 
     # ------------------------------------------------------------------
     # Display
@@ -91,6 +108,8 @@ class Card:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_index(cls, index: int) -> "Card":
+    def from_index(cls, index: int) -> Card:
         """Reconstruct a Card from its 0-51 index."""
-        raise NotImplementedError
+        cls.suit = index // 13
+        cls.rank = index % 13 + 2
+        return cls
