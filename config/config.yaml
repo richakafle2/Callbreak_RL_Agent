@@ -1,0 +1,81 @@
+game:
+  num_players: 4
+  num_rounds: 5               # rounds per full game
+  num_tricks: 13              # tricks per round
+  trump_suit: "spades"
+  min_bid: 1
+  max_bid: 13
+
+environment:
+  reward_shaping: true
+  intermediate_trick_reward: 0.1
+  overtrick_bonus_rate: 0.1   # per trick above bid
+  underbid_penalty_rate: 1.0  # multiplied by bid amount
+
+model:
+  encoder_type: "transformer" # "mlp" | "transformer"
+  embed_dim: 128
+  num_heads: 4
+  num_layers: 3
+  dropout: 0.1
+  hidden_dim: 256
+
+  bid_network:
+    hidden_dims: [128, 64]
+    output_dim: 13            # bid 1-13
+
+  play_network:
+    hidden_dims: [256, 128]
+    output_dim: 52            # one logit per card (masked to legal)
+
+ppo:
+  learning_rate: 3.0e-4
+  gamma: 0.99                 # discount factor
+  gae_lambda: 0.95            # GAE lambda
+  clip_epsilon: 0.2           # PPO clip range
+  entropy_coeff: 0.01         # encourage exploration
+  value_loss_coeff: 0.5
+  max_grad_norm: 0.5
+  num_epochs: 4               # PPO update epochs per rollout
+  batch_size: 64
+  rollout_steps: 2048         # steps per rollout collection
+
+training:
+  total_timesteps: 10_000_000
+  num_envs: 32                # parallel environments
+  eval_interval: 50_000       # steps between evaluations
+  save_interval: 100_000
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  seed: 42
+
+curriculum:
+  stages:
+    - name: "random"
+      opponents: ["random", "random", "random"]
+      threshold_winrate: 0.70   # advance when agent wins 70% of games
+    - name: "mixed"
+      opponents: ["random", "random", "safe_play"]
+      threshold_winrate: 0.65
+    - name: "safe"
+      opponents: ["safe_play", "safe_play", "safe_play"]
+      threshold_winrate: 0.60
+    - name: "self_play"
+      opponents: ["self", "self", "self"]
+      threshold_winrate: null   # run for fixed timesteps
+
+self_play:
+  pool_size: 20               # number of past checkpoints to keep
+  sample_strategy: "uniform"  # "uniform" | "prioritized"
+  update_every: 200_000       # steps before adding current agent to pool
+
+evaluation:
+  num_games: 200
+  opponents:
+    - "random"
+    - "safe_bet"
+    - "safe_play"
+    - "basic_bet"
+  elo:
+    initial_rating: 1000
+    k_factor: 32
