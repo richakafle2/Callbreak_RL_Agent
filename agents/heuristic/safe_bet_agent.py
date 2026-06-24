@@ -37,7 +37,7 @@ class SafeBetAgent(BaseAgent):
           2. _count_probable_tricks(hand)  — kings, queens, mid-trumps
           3. total = sure + 0.5 * probable, clamped to [min_bid, max_bid]
         """
-        hand = observation[]
+        hand = observation
         return self._count_sure_tricks(hand)
         raise NotImplementedError
 

@@ -44,7 +44,11 @@ class EloRating:
           R_a' = R_a + K * (S_a - E_a)
           where S_a = 1 for win, 0 for loss.
         """
-        raise NotImplementedError
+        R_a = self.get_rating(winner)
+        R_b = self.get_rating(loser)
+        E_a = 1 / (1 + 10^((R_b - R_a) / 400))
+        R_w_new = R_a + self.k_factor * (1 - E_a)
+        R_l_new = 
 
     def update_draw(self, agent_a: str, agent_b: str) -> Tuple[float, float]:
         """

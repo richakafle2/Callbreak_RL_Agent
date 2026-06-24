@@ -57,7 +57,11 @@ class Evaluator:
             'overall_win_rate': float,
           }
         """
-        raise NotImplementedError
+        scores = {}
+        for opp in self.oppo
+        if num_games:
+            for game in num_games:
+
 
     def run_games(
         self,
