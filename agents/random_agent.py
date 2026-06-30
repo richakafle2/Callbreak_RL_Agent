@@ -26,8 +26,9 @@ class RandomAgent(BaseAgent):
 
     def bid(self, observation: Dict) -> int:
         """Return a uniformly random bid in [min_bid, max_bid]."""
-        raise NotImplementedError
+        return random.randint(self.min_bid, self.max_bid)
 
     def play(self, observation: Dict) -> int:
         """Return the card index of a uniformly random legal card."""
-        raise NotImplementedError
+        legal_cards = observation["legal_cards"]
+        return self._rng.choice(legal_cards)
