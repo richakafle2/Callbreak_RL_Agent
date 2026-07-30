@@ -16,19 +16,26 @@ import torch
 import numpy as np
 import random
 
+# Curriculum order, per the 4-stage design: random -> mixed -> safe -> self-play.
+# NOTE: I'm assuming these are the exact string keys PPOTrainer's curriculum
+# uses internally. If trainer.py names them differently (e.g. "self_play" vs
+# "selfplay"), update this list to match.
+CURRICULUM_STAGES = ["random", "mixed", "safe", "self_play"]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Call Break RL agent")
     parser.add_argument("--config",  type=str, default="config/config.yaml")
     parser.add_argument("--stage",   type=str, default=None,
-                        help="Override curriculum starting stage")
+                         choices=CURRICULUM_STAGES,
+                         help="Override curriculum starting stage")
     parser.add_argument("--resume",  type=str, default=None,
-                        help="Path to checkpoint to resume from")
+                         help="Path to checkpoint to resume from")
     parser.add_argument("--seed",    type=int, default=None)
     parser.add_argument("--device",  type=str, default=None,
-                        help="cuda | cpu (default: auto)")
+                         help="cuda | cpu (default: auto)")
     parser.add_argument("--debug",   action="store_true",
-                        help="Use small hyperparameters for quick debugging")
+                         help="Use small hyperparameters for quick debugging")
     return parser.parse_args()
 
 
@@ -55,6 +62,30 @@ def apply_debug_overrides(config: dict) -> dict:
     config["training"]["eval_interval"] = 2_000
     config["ppo"]["num_epochs"] = 2
     return config
+
+
+def advance_curriculum_to_stage(trainer, stage: str) -> None:
+    """Force the trainer's curriculum to start at `stage` instead of stage 0.
+
+    ASSUMPTION: PPOTrainer exposes `set_curriculum_stage(stage_name: str)`.
+    If trainer.py instead tracks curriculum progress as a numeric index
+    (e.g. `trainer.curriculum_stage_idx`) or via a separate `Curriculum`
+    object (e.g. `trainer.curriculum.set_stage(...)`), this function is the
+    one place that needs updating to match.
+    """
+    if stage not in CURRICULUM_STAGES:
+        raise ValueError(
+            f"Unknown curriculum stage '{stage}'. Expected one of {CURRICULUM_STAGES}."
+        )
+
+    if not hasattr(trainer, "set_curriculum_stage"):
+        raise AttributeError(
+            "PPOTrainer has no `set_curriculum_stage` method. Update "
+            "advance_curriculum_to_stage() in train.py to match the real "
+            "curriculum API once trainer.py is implemented."
+        )
+
+    trainer.set_curriculum_stage(stage)
 
 
 def main() -> None:
@@ -89,7 +120,7 @@ def main() -> None:
     # Override starting stage
     if args.stage:
         print(f"Starting from curriculum stage: {args.stage}")
-        # TODO: advance curriculum to requested stage
+        advance_curriculum_to_stage(trainer, args.stage)
 
     # Run training
     print(f"Starting training for {config['training']['total_timesteps']:,} steps")

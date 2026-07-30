@@ -148,9 +148,9 @@ class ActorCritic(nn.Module):
         """Route obs (and history, if applicable) through the configured encoder."""
         if self.encoder_type == "transformer":
             return self.encoder(
-                obs,
-                card_history=card_history,
-                player_history=player_history,
+                static_features=obs,
+                card_history_ids=card_history,
+                player_history_ids=player_history,
                 history_mask=history_mask,
             )
         return self.encoder(obs)

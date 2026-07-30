@@ -30,5 +30,5 @@ class RandomAgent(BaseAgent):
 
     def play(self, observation: Dict) -> int:
         """Return the card index of a uniformly random legal card."""
-        legal_cards = observation["legal_cards"]
-        return self._rng.choice(legal_cards)
+        legal_cards = observation["legal_plays"]
+        return self._rng.choice(legal_cards).index

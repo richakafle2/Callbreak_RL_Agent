@@ -11,6 +11,8 @@ Two variants:
                         (card counting, void detection)
 """
 
+import math
+
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -27,16 +29,21 @@ class MLPEncoder(nn.Module):
         super().__init__()
         self.obs_dim = obs_dim
         self.embed_dim = embed_dim
-        # TODO: define self.net as a Sequential MLP
-        # Suggested architecture:
-        #   Linear(obs_dim, hidden_dim) → LayerNorm → ReLU → Dropout
-        #   Linear(hidden_dim, hidden_dim) → LayerNorm → ReLU → Dropout
-        #   Linear(hidden_dim, embed_dim)
-        raise NotImplementedError
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (batch, obs_dim) → (batch, embed_dim)"""
-        raise NotImplementedError
+        return self.net(x)
 
 
 class CardHistoryEncoder(nn.Module):
@@ -61,9 +68,21 @@ class CardHistoryEncoder(nn.Module):
         self.max_seq_len = max_seq_len
 
         # Card embedding: 52 possible cards → embed_dim
+        self.card_embedding = nn.Embedding(52, embed_dim)
         # Player embedding: 4 players → embed_dim
-        # Positional encoding: trick number (0-12) + position in trick (0-3)
-        raise NotImplementedError
+        self.player_embedding = nn.Embedding(4, embed_dim)
+
+        self.input_norm = nn.LayerNorm(embed_dim)
+        self.input_dropout = nn.Dropout(dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
     def forward(
         self,
@@ -72,11 +91,43 @@ class CardHistoryEncoder(nn.Module):
         padding_mask: torch.Tensor,   # (batch, seq_len) bool, True = padding
     ) -> torch.Tensor:
         """Returns (batch, embed_dim) pooled representation of the history."""
-        raise NotImplementedError
+        batch_size, seq_len = card_ids.shape
+
+        # No cards played yet (start of round) — nothing to attend over.
+        if seq_len == 0:
+            return torch.zeros(batch_size, self.embed_dim, device=card_ids.device)
+
+        card_emb = self.card_embedding(card_ids)      # (batch, seq_len, embed_dim)
+        player_emb = self.player_embedding(player_ids)  # (batch, seq_len, embed_dim)
+        pos_emb = self._build_positional_encoding(seq_len, card_ids.device)  # (seq_len, embed_dim)
+        pos_emb = pos_emb.unsqueeze(0)  # (1, seq_len, embed_dim) — broadcasts over batch
+
+        x = card_emb + player_emb + pos_emb
+        x = self.input_norm(x)
+        x = self.input_dropout(x)
+
+        # nn.TransformerEncoder treats True in src_key_padding_mask as "ignore this position".
+        encoded = self.transformer(x, src_key_padding_mask=padding_mask)  # (batch, seq_len, embed_dim)
+
+        # Masked mean-pool over the real (non-padding) positions.
+        valid = (~padding_mask).unsqueeze(-1).to(encoded.dtype)  # (batch, seq_len, 1)
+        summed = (encoded * valid).sum(dim=1)                     # (batch, embed_dim)
+        counts = valid.sum(dim=1).clamp(min=1.0)                  # (batch, 1) avoid /0
+        pooled = summed / counts
+
+        return pooled
 
     def _build_positional_encoding(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Return sinusoidal positional encodings of shape (seq_len, embed_dim)."""
-        raise NotImplementedError
+        pe = torch.zeros(seq_len, self.embed_dim, device=device)
+        position = torch.arange(0, seq_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.embed_dim, 2, dtype=torch.float, device=device)
+            * (-math.log(10000.0) / self.embed_dim)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 
 
 class TransformerEncoder(nn.Module):
@@ -101,7 +152,13 @@ class TransformerEncoder(nn.Module):
         self.history_encoder = CardHistoryEncoder(embed_dim, num_heads, num_layers, dropout=dropout)
 
         # Fusion layer: concatenate static + history → embed_dim
-        raise NotImplementedError
+        self.fusion = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+        )
 
     def forward(
         self,
@@ -111,4 +168,8 @@ class TransformerEncoder(nn.Module):
         history_mask: torch.Tensor,       # (batch, seq_len) bool
     ) -> torch.Tensor:
         """Returns fused latent (batch, embed_dim)."""
-        raise NotImplementedError
+        static_latent = self.static_encoder(static_features)
+        history_latent = self.history_encoder(card_history_ids, player_history_ids, history_mask)
+
+        fused = torch.cat([static_latent, history_latent], dim=-1)
+        return self.fusion(fused)
