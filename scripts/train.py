@@ -67,25 +67,22 @@ def apply_debug_overrides(config: dict) -> dict:
 def advance_curriculum_to_stage(trainer, stage: str) -> None:
     """Force the trainer's curriculum to start at `stage` instead of stage 0.
 
-    ASSUMPTION: PPOTrainer exposes `set_curriculum_stage(stage_name: str)`.
-    If trainer.py instead tracks curriculum progress as a numeric index
-    (e.g. `trainer.curriculum_stage_idx`) or via a separate `Curriculum`
-    object (e.g. `trainer.curriculum.set_stage(...)`), this function is the
-    one place that needs updating to match.
+    trainer.curriculum is a CurriculumScheduler. It tracks progress as a
+    plain integer index (`_current_idx`) into `self.stages`, a list of
+    CurriculumStage objects (each with a `.name`). There is no set_stage()
+    method, so we look up the target stage's index by name and set
+    `_current_idx` directly. train() re-derives opponents from the current
+    stage via get_opponents() at the top of its loop, so this is safe to
+    call any time before trainer.train() runs.
     """
-    if stage not in CURRICULUM_STAGES:
+    stage_names = [s.name for s in trainer.curriculum.stages]
+
+    if stage not in stage_names:
         raise ValueError(
-            f"Unknown curriculum stage '{stage}'. Expected one of {CURRICULUM_STAGES}."
+            f"Unknown curriculum stage '{stage}'. Expected one of {stage_names}."
         )
 
-    if not hasattr(trainer, "set_curriculum_stage"):
-        raise AttributeError(
-            "PPOTrainer has no `set_curriculum_stage` method. Update "
-            "advance_curriculum_to_stage() in train.py to match the real "
-            "curriculum API once trainer.py is implemented."
-        )
-
-    trainer.set_curriculum_stage(stage)
+    trainer.curriculum._current_idx = stage_names.index(stage)
 
 
 def main() -> None:

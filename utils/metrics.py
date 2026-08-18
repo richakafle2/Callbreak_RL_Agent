@@ -40,23 +40,37 @@ class CallBreakMetrics:
 
     def bid_accuracy(self) -> float:
         """Fraction of rounds where the agent met or exceeded their bid."""
-        raise NotImplementedError
+        if not self._bids:
+            return 0.0
+        hits = sum(1 for b, t in zip(self._bids, self._tricks_won) if t >= b)
+        return hits / len(self._bids)
 
     def mean_bid(self) -> float:
         """Average bid across rounds (proxy for risk appetite)."""
-        raise NotImplementedError
+        if not self._bids:
+            return 0.0
+        return float(np.mean(self._bids))
 
     def mean_score(self) -> float:
         """Mean per-round score."""
-        raise NotImplementedError
+        if not self._scores:
+            return 0.0
+        return float(np.mean(self._scores))
 
     def mean_overtrick(self) -> float:
         """Average excess tricks when bid was met (lower = more efficient)."""
-        raise NotImplementedError
+        overtricks = [
+            t - b for b, t in zip(self._bids, self._tricks_won) if t >= b
+        ]
+        if not overtricks:
+            return 0.0
+        return float(np.mean(overtricks))
 
     def win_rate(self) -> float:
         """Fraction of games won (agent had highest total score)."""
-        raise NotImplementedError
+        if not self._game_results:
+            return 0.0
+        return float(np.mean(self._game_results))
 
     def bid_calibration(self) -> Dict:
         """
@@ -65,11 +79,41 @@ class CallBreakMetrics:
 
         Returns: {'bid': [...], 'actual_mean_tricks': [...], 'accuracy': [...]}
         """
-        raise NotImplementedError
+        bids_arr = np.asarray(self._bids)
+        tricks_arr = np.asarray(self._tricks_won)
+
+        bid_values, mean_tricks, accuracy = [], [], []
+        for bid_value in range(1, 14):
+            mask = bids_arr == bid_value
+            if not np.any(mask):
+                continue
+            bid_values.append(bid_value)
+            mean_tricks.append(float(tricks_arr[mask].mean()))
+            accuracy.append(float((tricks_arr[mask] >= bid_value).mean()))
+
+        return {
+            "bid": bid_values,
+            "actual_mean_tricks": mean_tricks,
+            "accuracy": accuracy,
+        }
 
     def score_distribution(self) -> Dict:
         """Return percentile stats of per-round scores."""
-        raise NotImplementedError
+        if not self._scores:
+            return {
+                "min": 0.0, "p25": 0.0, "median": 0.0,
+                "p75": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0,
+            }
+        scores_arr = np.asarray(self._scores)
+        return {
+            "min": float(np.min(scores_arr)),
+            "p25": float(np.percentile(scores_arr, 25)),
+            "median": float(np.median(scores_arr)),
+            "p75": float(np.percentile(scores_arr, 75)),
+            "max": float(np.max(scores_arr)),
+            "mean": float(np.mean(scores_arr)),
+            "std": float(np.std(scores_arr)),
+        }
 
     def summary(self) -> Dict:
         """Return all metrics as a flat dict."""
@@ -91,9 +135,9 @@ class CallBreakMetrics:
         Return a dict of deltas (a - b) for common metric keys.
         Positive delta means `a` is better.
         """
-        raise NotImplementedError
-
-    @staticmethod
-    def elo_win_probability(rating_a: float, rating_b: float) -> float:
-        """Expected win probability for agent with rating_a vs rating_b."""
-        raise NotImplementedError
+        common_keys = set(metrics_a.keys()) & set(metrics_b.keys())
+        return {
+            key: metrics_a[key] - metrics_b[key]
+            for key in common_keys
+            if isinstance(metrics_a[key], (int, float)) and isinstance(metrics_b[key], (int, float))
+        }

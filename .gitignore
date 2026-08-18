@@ -1,0 +1,6 @@
+logs/
+logs_mlp/
+logs_transformer/
+checkpoints/
+checkpoints_mlp/
+checkpoints_transformer/

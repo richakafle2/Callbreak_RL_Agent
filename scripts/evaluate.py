@@ -42,7 +42,7 @@ def main() -> None:
     from agents.rl.ppo_agent import PPOAgent
     agent = PPOAgent.from_checkpoint(
         checkpoint_path=args.checkpoint,
-        model_config=config["model"],
+        model_config={"obs_dim": config["obs_dim"], **config["model"]},
         player_id=0,
         device=device,
     )

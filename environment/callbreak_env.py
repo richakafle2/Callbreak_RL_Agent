@@ -199,11 +199,13 @@ class CallBreakEnv(gym.Env):
 
     def _build_info(self):
         info = {"round_number": self._round_number, "total_scores": list(self._total_scores),
-                "phase": "done", "bids": [None]*4, "tricks_won": [0]*4, "legal_actions": []}
+                "phase": "done", "bids": [None]*4, "tricks_won": [0]*4, "legal_actions": [],
+                "cards_played_history": []}
         if self._round is None or self._round_number >= self.num_rounds:
             return info
         obs = self._round.get_observation(0)
         info.update({"phase": obs["phase"], "bids": obs["bids"],
                      "tricks_won": obs.get("tricks_won", [0]*4),
-                     "legal_actions": np.where(self._get_legal_action_mask())[0].tolist()})
+                     "legal_actions": np.where(self._get_legal_action_mask())[0].tolist(),
+                     "cards_played_history": obs.get("cards_played_history", [])})
         return info

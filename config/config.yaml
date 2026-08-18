@@ -13,20 +13,20 @@ environment:
   underbid_penalty_rate: 1.0  # multiplied by bid amount
 
 model:
-  encoder_type: "transformer" # "mlp" | "transformer"
+  encoder_type: "mlp"  # "mlp" | "transformer"
   embed_dim: 128
   num_heads: 4
   num_layers: 3
   dropout: 0.1
   hidden_dim: 256
 
-  bid_network:
-    hidden_dims: [128, 64]
-    output_dim: 13            # bid 1-13
+  # bid_network:
+  #   hidden_dims: [128, 64]
+  #   output_dim: 13            # bid 1-13
 
-  play_network:
-    hidden_dims: [256, 128]
-    output_dim: 52            # one logit per card (masked to legal)
+  # play_network:
+  #   hidden_dims: [256, 128]
+  #   output_dim: 52            # one logit per card (masked to legal)
 
 ppo:
   learning_rate: 3.0e-4
@@ -45,8 +45,8 @@ training:
   num_envs: 32                # parallel environments
   eval_interval: 50_000       # steps between evaluations
   save_interval: 100_000
-  checkpoint_dir: "checkpoints"
-  log_dir: "logs"
+  checkpoint_dir: "checkpoints_mlp"
+  log_dir: "logs_mlp"
   seed: 42
 
 curriculum:
@@ -55,13 +55,13 @@ curriculum:
       opponents: ["random", "random", "random"]
       threshold_winrate: 0.70   # advance when agent wins 70% of games
     - name: "mixed"
-      opponents: ["random", "random", "safe_play"]
+      opponents: ["random", "safe_play", "basic_bet"]
       threshold_winrate: 0.65
     - name: "safe"
       opponents: ["safe_play", "safe_play", "safe_play"]
       threshold_winrate: 0.60
     - name: "self_play"
-      opponents: ["self", "self", "self"]
+      opponents: ["basic_bet", "self", "self"]
       threshold_winrate: null   # run for fixed timesteps
 
 self_play:
