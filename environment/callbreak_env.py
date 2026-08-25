@@ -97,6 +97,22 @@ class CallBreakEnv(gym.Env):
         self._round = Round(round_number=self._round_number, seed=int_seed)
         self._round.deal()
 
+    def _opponent_bid_tricks_state(self) -> Tuple[List[int], List[int]]:
+        """
+        Snapshot each opponent's (bid, tricks_won) at the current moment,
+        for the denial bonus in trick_won_reward(). Seats 1-3 are the three
+        opponents, in seat order.
+
+        Safe to call at any point during trick resolution: an opponent's
+        tricks_won only increments when THEY win a trick, so if the agent
+        (seat 0) is the one whose trick_won_reward is being computed this
+        call, seats 1-3's tricks_won here are unaffected by the trick that
+        just resolved and reflect their state going into it.
+        """
+        bids = self._round.bidding.bids
+        tricks_won = self._round.playing.tricks_won
+        return list(bids[1:4]), list(tricks_won[1:4])
+
     def _run_opponents_until_agent_turn(self):
         shaped_reward = 0.0
         while True:
@@ -122,8 +138,11 @@ class CallBreakEnv(gym.Env):
             if winner is not None:
                 curr_tricks = self._round.playing.tricks_won[0]
                 if winner == 0:
+                    opp_bids, opp_tricks = self._opponent_bid_tricks_state()
                     shaped_reward += self.reward_shaper.trick_won_reward(
-                        curr_tricks, self._round.bidding.bids[0]
+                        curr_tricks, self._round.bidding.bids[0],
+                        opponent_bids=opp_bids,
+                        opponent_tricks_won=opp_tricks,
                     )
                 if self._round.playing.is_complete:
                     break
@@ -144,7 +163,12 @@ class CallBreakEnv(gym.Env):
         curr_tricks = self._round.playing.tricks_won[0]
         bid = self._round.bidding.bids[0]
         if winner == 0:
-            return self.reward_shaper.trick_won_reward(curr_tricks, bid)
+            opp_bids, opp_tricks = self._opponent_bid_tricks_state()
+            return self.reward_shaper.trick_won_reward(
+                curr_tricks, bid,
+                opponent_bids=opp_bids,
+                opponent_tricks_won=opp_tricks,
+            )
         return self.reward_shaper.trick_lost_reward(curr_tricks, bid)
 
     def _round_end_reward(self):

@@ -55,6 +55,9 @@ def main() -> None:
     results = evaluator.evaluate(agent, num_games=args.games)
 
     evaluator.print_summary(results)
+    evaluator.print_bid_comparison(results)
+    evaluator.print_play_diagnostics(results)
+    evaluator.print_bid_by_strength(results)  
 
     if args.output:
         import json

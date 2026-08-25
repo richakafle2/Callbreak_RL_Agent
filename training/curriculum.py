@@ -4,34 +4,25 @@ curriculum.py
 Curriculum scheduler that manages training stage progression.
 
 Stages (from config):
-  1. random    — all random opponents        → advance at 70% win rate
-  2. mixed     — random + safe_play mix      → advance at 65%
-  3. safe      — all safe_play opponents     → advance at 60%
-  4. self_play — pool of past selves         → run for fixed timesteps
+  1. random      — all random opponents          → advance at 70% win rate
+  2. mixed       — random + safe_play + basic_bet → advance at 55%
+  3. safe        — all safe_play opponents        → advance at 60%
+  4. mixed_self  — basic_bet + self + safe_play    → advance at 55%
+  5. self_play   — basic_bet + self + self         → run for fixed timesteps
 
-Each stage has a `threshold_winrate` that triggers advancement.
+Each stage has a `threshold_winrate` that triggers advancement. A stage with
+`threshold_winrate: null` instead runs for a fixed number of timesteps
+(see `advance()`), which is currently only true of the terminal `self_play`
+stage.
 
-NOTE: `record_result()` and `advance()` below aren't part of the original
-skeleton's method stubs (only `_build_stages`, `current_stage`, `stage_name`,
-`is_self_play`, and `get_opponents` were present as stubs). Something has to
-feed game outcomes into each CurriculumStage's win/loss counters and decide
-when to move to the next stage, and `CurriculumStage.should_advance()`
-implies that shape of API, so I've added the minimal pair of methods needed
-to make the scheduler usable end-to-end. Flag if trainer.py should own this
-bookkeeping instead.
-
-[FIX] advance() previously checked `if self.is_self_play: return False`
-before ever reaching the self_play-specific "ran for enough timesteps"
-check below it -- since self_play IS the last stage, that guard fired
-every single time and the timestep check was unreachable dead code. This
-meant advance() could never report "self_play curriculum complete," even
-once min_self_play_timesteps was satisfied, silently defeating the
-logging/detection purpose the docstring describes. Fixed by checking
-self_play's own completion criteria first, and only using is_last_stage to
-gate whether there's actually a next stage index to move into.
+Any stage whose `opponents` list includes `"self"` draws that opponent from
+a SelfPlayPool of past checkpoints rather than from AGENT_REGISTRY --
+`get_opponents()` resolves this per-seat, so a stage can mix heuristic and
+self-play opponents in the same game (e.g. `mixed_self`), not just switch
+wholesale from one to the other.
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from agents.random_agent import RandomAgent
 from agents.heuristic.safe_bet_agent import SafeBetAgent
 from agents.heuristic.safe_play_agent import SafePlayAgent
@@ -49,7 +40,13 @@ AGENT_REGISTRY = {
 
 
 class CurriculumStage:
-    def __init__(self, name: str, opponents: List[str], threshold_winrate: Optional[float]):
+    def __init__(
+        self,
+        name: str,
+        opponents: List[str],
+        threshold_winrate: Optional[float],
+        recent_window: int = 5,
+    ):
         self.name = name
         self.opponents = opponents                  # list of 3 agent type strings
         self.threshold_winrate = threshold_winrate  # None = run until timestep limit
@@ -57,17 +54,50 @@ class CurriculumStage:
         self.games_played: int = 0
         self.wins: int = 0
 
+        # Rolling window of (wins, games) per eval batch, most recent last.
+        # should_advance() gates on this instead of the all-time cumulative
+        # rate, so stale performance from right after entering the stage
+        # (e.g. while a self-play pool was still empty and falling back to
+        # a heuristic) doesn't permanently drag down the average that
+        # decides advancement.
+        self._recent_window = recent_window
+        self._recent_batches: List[Tuple[int, int]] = []  # (wins, games) per batch
+
     @property
     def win_rate(self) -> float:
+        """All-time cumulative win rate since entering this stage."""
         return self.wins / self.games_played if self.games_played > 0 else 0.0
 
+    @property
+    def recent_win_rate(self) -> float:
+        """Win rate over just the last `recent_window` eval batches."""
+        if not self._recent_batches:
+            return 0.0
+        wins = sum(w for w, _ in self._recent_batches)
+        games = sum(g for _, g in self._recent_batches)
+        return wins / games if games > 0 else 0.0
+
+    def record_batch(self, wins: int, games: int) -> None:
+        """
+        Record one eval batch's (wins, games) as a single windowed sample.
+        Call this once per evaluation cycle (e.g. once per 200-game eval),
+        in addition to record_result() per individual game, so
+        recent_win_rate reflects only the last few cycles rather than the
+        whole stage's history.
+        """
+        self._recent_batches.append((wins, games))
+        if len(self._recent_batches) > self._recent_window:
+            self._recent_batches.pop(0)
+
     def should_advance(self) -> bool:
-        """Return True when win rate has exceeded the threshold."""
+        """Return True when the recent-window win rate has exceeded the threshold."""
         if self.threshold_winrate is None:
             return False
         if self.games_played < 100:    # need minimum sample before advancing
             return False
-        return self.win_rate >= self.threshold_winrate
+        if not self._recent_batches:
+            return False
+        return self.recent_win_rate >= self.threshold_winrate
 
 
 class CurriculumScheduler:
@@ -110,7 +140,8 @@ class CurriculumScheduler:
 
     @property
     def is_self_play(self) -> bool:
-        return self.current_stage.name == "self_play"
+        """True if the current stage's opponent list includes any "self" slots."""
+        return "self" in self.current_stage.opponents
 
     @property
     def is_last_stage(self) -> bool:
@@ -124,7 +155,8 @@ class CurriculumScheduler:
         """
         Wire up the SelfPlayPool + the model architecture/device needed to
         rehydrate ActorCritic checkpoints into playable opponents. Must be
-        called before get_opponents() is used during the self_play stage.
+        called before get_opponents() is used during any stage whose
+        opponent list contains "self".
         """
         self._self_play_pool = pool
         self._model_config = model_config
@@ -136,46 +168,61 @@ class CurriculumScheduler:
 
     def get_opponents(self, self_play_pool: Optional[Any] = None) -> List:
         """
-        Return a list of 3 instantiated opponent agents for the current stage.
+        Return a list of 3 instantiated opponent agents for the current
+        stage, resolved seat-by-seat against config['stages'][...]['opponents'].
+
+        Any seat whose name is "self" is filled from the self-play pool (or
+        the BasicBetAgent bootstrap fallback if the pool is still empty).
+        Every other seat is built directly from AGENT_REGISTRY, exactly as
+        configured.
         """
         pool = self_play_pool if self_play_pool is not None else self._self_play_pool
+        opponents_spec = self.current_stage.opponents
+        self_seats = [seat for seat, name in enumerate(opponents_spec) if name == "self"]
 
-        if self.is_self_play:
+        self_agents_by_seat: Dict[int, Any] = {}
+        if self_seats:
             if pool is None:
                 raise RuntimeError(
-                    "Reached the self_play stage but no SelfPlayPool was "
-                    "provided — call set_self_play_context() first."
+                    f"Stage '{self.stage_name}' includes 'self' opponents but "
+                    "no SelfPlayPool was provided — call "
+                    "set_self_play_context() first."
                 )
+
             if pool.is_empty():
                 # Bootstrap case: pool hasn't been seeded with any checkpoint
-                # yet (e.g. self_play is reached before the first snapshot is
-                # saved). Fall back to the strongest heuristic so training
-                # doesn't stall on an empty sample().
-                return [BasicBetAgent(player_id=seat + 1) for seat in range(3)]
-
-            if self._model_config is None or self._device is None:
-                raise RuntimeError(
-                    "SelfPlayPool is set but model_config/device are missing "
-                    "— call set_self_play_context() with all three arguments."
+                # yet (e.g. this stage is reached before the first snapshot
+                # is saved). Fall back to the strongest heuristic for just
+                # the "self" seats, leaving any other configured seats alone.
+                for seat in self_seats:
+                    self_agents_by_seat[seat] = BasicBetAgent(player_id=seat + 1)
+            else:
+                if self._model_config is None or self._device is None:
+                    raise RuntimeError(
+                        "SelfPlayPool is set but model_config/device are "
+                        "missing — call set_self_play_context() with all "
+                        "three arguments."
+                    )
+                models = pool.sample_opponents(
+                    len(self_seats), self._model_config, self._device
                 )
+                for seat, model in zip(self_seats, models):
+                    self_agents_by_seat[seat] = PPOAgent(
+                        player_id=seat + 1,
+                        model=model,
+                        encoder=StateEncoder(),
+                        device=self._device,
+                        deterministic=False,  # sample, don't argmax, for variety
+                        name=f"pool_opponent_{seat + 1}",
+                    )
 
-            models = pool.sample_opponents(3, self._model_config, self._device)
-            return [
-                PPOAgent(
-                    player_id=seat + 1,
-                    model=model,
-                    encoder=StateEncoder(),
-                    device=self._device,
-                    deterministic=False,  # sample, don't argmax, for opponent variety
-                    name=f"pool_opponent_{seat + 1}",
-                )
-                for seat, model in enumerate(models)
-            ]
-
-        return [
-            AGENT_REGISTRY[name](player_id=seat + 1)
-            for seat, name in enumerate(self.current_stage.opponents)
-        ]
+        opponents = []
+        for seat, name in enumerate(opponents_spec):
+            if seat in self_agents_by_seat:
+                opponents.append(self_agents_by_seat[seat])
+            else:
+                opponents.append(AGENT_REGISTRY[name](player_id=seat + 1))
+        return opponents
 
     # ------------------------------------------------------------------
     # Progress tracking / advancement
@@ -198,26 +245,17 @@ class CurriculumScheduler:
         Move to the next curriculum stage if the current stage's promotion
         criteria are met. Returns True if the stage index actually advanced.
 
-        - Non-self_play stages advance once `should_advance()` is True
-          (win rate over threshold with enough games played).
-        - The self_play stage has no win-rate threshold (`threshold_winrate`
-          is None) and instead runs for a fixed number of timesteps. Since
-          self_play is the final stage, there's no next index to move into
-          -- but we still want `stage.should_advance()`-equivalent detection
-          to work here so callers (e.g. trainer.py's logging) can tell when
-          the fixed-timestep run is "done," even though the index itself
-          won't move.
-
-        [FIX] Previously `if self.is_last_stage: return False` ran BEFORE
-        the self_play timestep check, so that check was unreachable dead
-        code -- self_play is always the last stage. Now the self_play
-        completion check runs first (as a pure detection signal, no index
-        change), and is_last_stage is only used to decide whether advancing
-        the index is possible at all.
+        - Stages with a numeric threshold_winrate advance once
+          should_advance() is True (win rate over threshold with enough
+          games played).
+        - A stage with threshold_winrate == None instead runs for a fixed
+          number of timesteps (min_self_play_timesteps), and never advances
+          the stage index -- this is used for the terminal self_play stage,
+          which has nowhere further to advance to.
         """
         stage = self.current_stage
 
-        if stage.name == "self_play":
+        if stage.threshold_winrate is None:
             if min_self_play_timesteps is None:
                 return False
             return stage.timesteps_in_stage >= min_self_play_timesteps

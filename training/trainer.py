@@ -35,33 +35,54 @@ these should be designed differently):
 
   4. SelfPlayPool isn't constructed in __init__ (only CurriculumScheduler,
      Evaluator, and Logger are). It's built lazily inside train() the first
-     time the curriculum reaches the self_play stage, using
-     config.get("self_play", {}) for pool_size/sample_strategy/checkpoint_dir.
+     time the curriculum reaches a stage whose opponents include "self",
+     using config.get("self_play", {}) for pool_size/sample_strategy/
+     checkpoint_dir.
 
   5. Evaluator's exact method signature wasn't available to me here; I've
      assumed `evaluator.evaluate(model, opponents, num_games) -> {"win_rate":
      float, ...}`. If evaluator.py's real signature differs, `_run_evaluation`
      is the one place that needs updating.
 
-  6. [FIX] Curriculum advancement bug: _run_evaluation() used to feed the
-     *global* evaluation-suite win rate (config['evaluation']['opponents'] --
-     random/safe_bet/safe_play/basic_bet blended together) into
-     curriculum.record_result(), which is what should_advance() checks
-     against each stage's threshold_winrate. That meant a stage could only
-     ever advance once the agent was already beating the ENTIRE fixed suite
-     at the threshold rate -- including opponents that stage doesn't even
-     train against. In practice this meant "mixed" (threshold 0.65) never
-     advanced, since overall win rate landed at 64.1% / 62.0% across two
-     full 10M-step runs -- just under the bar, for a bar that was never the
-     right bar to check for that stage.
-
-     Fixed by running a SECOND, stage-specific evaluation using
+  6. Curriculum advancement runs a SECOND, stage-specific evaluation using
      evaluator.run_games() directly against self._get_current_opponents()
      (the actual opponents this stage trains against, including live
      self-play model instances -- run_games() takes pre-instantiated agents,
-     so this works for self_play too), and feeding THAT win rate into
-     curriculum.record_result(). The global-suite eval is kept exactly as
-     before, purely for logging and best-checkpoint selection.
+     so this works for any stage that mixes in "self"). THIS stage-specific
+     win rate is what gets fed into curriculum.record_result() /
+     record_batch(), because should_advance() is checking "has the agent
+     mastered what this stage is teaching it," not "does it already beat
+     the whole global eval suite." The global-suite eval (evaluate()) is
+     kept exactly as before, purely for logging and best-checkpoint
+     selection -- it should NOT gate curriculum advancement, since it
+     blends in opponents (e.g. "random") the current stage may not even
+     train against, and near-ceiling performance against easy opponents can
+     mask stagnation against the ones that matter for this stage.
+
+  7. [FIX] CurriculumStage.should_advance() now gates on a rolling window of
+     the last few eval batches (stage.recent_win_rate) instead of the
+     all-time cumulative rate since stage entry (stage.win_rate). The
+     cumulative rate pools every eval batch since the stage started with
+     equal weight -- including early batches recorded right after entering
+     a "self"-containing stage, while the self-play pool was still empty
+     and falling back to a heuristic opponent (a materially different, and
+     likely easier, matchup than a real self-play sample). That stale data
+     can permanently drag the cumulative average below threshold even once
+     recent performance has genuinely cleared it. record_batch() must be
+     called once per evaluation cycle (see _run_evaluation()) for this
+     window to be populated -- record_result() alone only updates the
+     all-time cumulative counters.
+
+  8. [FIX] stage.timesteps_in_stage was previously never incremented
+     anywhere -- record_result() accepts a `timesteps` argument, but
+     _run_evaluation() never passed one, so it silently defaulted to 0 on
+     every call. This meant the terminal self_play stage's fixed-timestep
+     completion check (`stage.timesteps_in_stage >= min_self_play_timesteps`)
+     could never become True, since 0 >= N is always False for a positive
+     budget. Fixed by incrementing stage.timesteps_in_stage by
+     steps_per_rollout once per rollout in train(), alongside
+     self.global_step -- this is the actual place training time elapses,
+     not inside the per-game evaluation loop.
 """
 
 import os
@@ -203,8 +224,8 @@ class PPOTrainer:
         self.global_step: int = 0
         self.best_eval_score: float = -float("inf")
 
-        # Built lazily once the curriculum reaches the self_play stage
-        # (see _ensure_self_play_pool).
+        # Built lazily once the curriculum reaches a stage whose opponents
+        # include "self" (see _ensure_self_play_pool).
         self._self_play_pool: Optional[SelfPlayPool] = None
 
         self.checkpoint_dir = config["training"].get("checkpoint_dir", "checkpoints")
@@ -240,11 +261,20 @@ class PPOTrainer:
             self.buffer.reset()
             self.global_step += steps_per_rollout
 
-            # [FIX] Re-enabled: this was commented out, which meant both
-            # prior runs trained with zero visibility into which curriculum
-            # stage was active at any point over 10M steps.
+            # [FIX 8] Track elapsed timesteps against the CURRENT curriculum
+            # stage. This is what the terminal self_play stage's
+            # fixed-timestep completion check (advance(min_self_play_timesteps))
+            # actually reads -- it was never incremented anywhere before,
+            # so that check could never become True. This is the right
+            # place for it: it's where training time actually elapses,
+            # once per rollout, independent of how often evaluation runs.
+            self.curriculum.current_stage.timesteps_in_stage += steps_per_rollout
+
+            # Re-enabled: this was previously commented out, which meant
+            # both prior runs trained with zero visibility into which
+            # curriculum stage was active at any point over 10M steps.
             #
-            # [FIX 2] log_scalars() forwards every value straight into
+            # log_scalars() forwards every value straight into
             # TensorBoard's add_scalar(), which requires a float -- passing
             # the stage NAME ("mixed") crashed immediately. Logging the
             # numeric stage index instead keeps this TensorBoard-safe; the
@@ -263,15 +293,20 @@ class PPOTrainer:
             if self.global_step - last_eval_step >= eval_interval:
                 last_eval_step = self.global_step
                 eval_result = self._run_evaluation()
-                # [FIX 2] eval_result only carries the numeric stage index
-                # (TensorBoard-safe), so print the human-readable name +
-                # the win rate that actually gates advancement here, on
-                # every eval cycle -- not just when a stage change happens.
+                stage = self.curriculum.current_stage
+                # Print cumulative AND recent-window win rate alongside the
+                # single eval batch's rate. should_advance() gates on
+                # recent_win_rate (see [FIX 7]), not the per-batch number
+                # or the all-time cumulative one -- printing all three here
+                # means a stuck-looking per-batch number is no longer the
+                # only thing visible in the logs.
                 print(
                     f"[eval] step={self.global_step:,} "
                     f"stage={self.curriculum.stage_name} "
                     f"stage_win_rate={eval_result['eval_stage_win_rate']:.1%} "
-                    f"(threshold={self.curriculum.current_stage.threshold_winrate}) "
+                    f"cumulative={stage.win_rate:.1%} "
+                    f"recent{stage._recent_window}={stage.recent_win_rate:.1%} "
+                    f"(threshold={stage.threshold_winrate}) "
                     f"overall_win_rate={eval_result['eval_overall_win_rate']:.1%}"
                 )
                 self.logger.log_scalars(eval_result, step=self.global_step)
@@ -296,13 +331,16 @@ class PPOTrainer:
                 if self.curriculum.is_self_play:
                     pool = self._ensure_self_play_pool()
                     pool.add(self.model, self.global_step)
-                    # self_play is the terminal curriculum stage, so
-                    # curriculum.advance() never returns True again once
-                    # we're here -- meaning opponents/envs would otherwise
-                    # never be rebuilt again, and freshly-added pool
-                    # checkpoints would never actually get sampled into
-                    # training. Rebuild now so newer past-selves enter
-                    # rotation as the pool grows.
+                    # A stage whose opponents include "self" doesn't
+                    # necessarily advance the curriculum index every time
+                    # (e.g. "mixed_self" advances by win rate; only the
+                    # terminal "self_play" stage runs for a fixed timestep
+                    # budget and never moves the index again) -- either
+                    # way, newly-added pool checkpoints won't get sampled
+                    # into training unless opponents/envs are rebuilt.
+                    # Rebuild now so newer past-selves enter rotation as
+                    # the pool grows, regardless of whether advance() also
+                    # fired this cycle.
                     opponents = self._get_current_opponents()
                     envs = self._make_envs(opponents)
 
@@ -613,11 +651,12 @@ class PPOTrainer:
         """
         Wrapper around curriculum.get_opponents() that guarantees the
         SelfPlayPool exists (and set_self_play_context has been called)
-        before we ever ask the curriculum for self_play opponents. Needed
-        because pool creation otherwise only happens inside the checkpoint
-        block in train(), which can run *after* get_opponents() is first
-        called for the self_play stage (e.g. immediately on curriculum
-        advancement, or when --stage self_play force-starts training there).
+        before we ever ask the curriculum for opponents in a stage that
+        includes "self". Needed because pool creation otherwise only
+        happens inside the checkpoint block in train(), which can run
+        *after* get_opponents() is first called for such a stage (e.g.
+        immediately on curriculum advancement, or when --stage mixed_self /
+        --stage self_play force-starts training there).
         """
         if self.curriculum.is_self_play:
             self._ensure_self_play_pool()
@@ -657,21 +696,14 @@ class PPOTrainer:
              it includes opponents the current stage may not even train
              against.
 
-          2. [FIX] Stage-specific eval, against self._get_current_opponents()
-             -- the actual opponents this stage trains against (works for
-             self_play too, since run_games() accepts pre-instantiated
-             agents, including live self-play model wrappers). THIS is what
-             gets fed into curriculum.record_result(), because
-             should_advance() is checking "has the agent mastered what this
-             stage is teaching it," not "does it already beat everything."
-
-        Previously, step 2 didn't exist -- the global win rate was recorded
-        into the curriculum directly, which is why both prior runs stalled
-        in the "mixed" stage (threshold 0.65) despite performing reasonably:
-        overall win rate (64.1% / 62.0%) never crossed 0.65, because it
-        includes safe_bet (~49%) and basic_bet (~22%) dragging the average
-        down -- neither of which "mixed"'s own threshold was ever meant to
-        require beating at that rate in isolation.
+          2. Stage-specific eval, against self._get_current_opponents() --
+             the actual opponents this stage trains against (works for any
+             "self"-containing stage, since run_games() accepts
+             pre-instantiated agents, including live self-play model
+             wrappers). THIS is what gets fed into curriculum.record_result()
+             / record_batch(), because should_advance() is checking "has
+             the agent mastered what this stage is teaching it," not "does
+             it already beat everything."
         """
         from agents.rl.ppo_agent import PPOAgent
         from utils.state_encoder import StateEncoder
@@ -690,7 +722,7 @@ class PPOTrainer:
         # --- 1. Global suite: logging / best-checkpoint selection only ---
         result = self.evaluator.evaluate(eval_agent, num_games=num_games)
 
-        # --- 2. [FIX] Stage-specific: this is what gates curriculum advancement ---
+        # --- 2. Stage-specific: this is what gates curriculum advancement ---
         stage_opponents = self._get_current_opponents()
         stage_games = self.evaluator.run_games(eval_agent, stage_opponents, num_games)
         stage_wins = stage_games["wins"]
@@ -698,16 +730,31 @@ class PPOTrainer:
         for i in range(num_games):
             self.curriculum.record_result(i < stage_wins)
 
+        # [FIX 7] Record this cycle's (wins, games) as one windowed sample,
+        # separately from the per-game record_result() calls above.
+        # should_advance() gates on this rolling window (recent_win_rate),
+        # not the all-time cumulative rate, so recent performance isn't
+        # permanently diluted by whatever happened right after the stage
+        # was entered (e.g. an empty self-play pool falling back to a
+        # heuristic opponent for a few cycles).
+        self.curriculum.current_stage.record_batch(stage_wins, num_games)
+
         flat = {
             "eval_overall_win_rate": result["overall_win_rate"],
             "eval_bid_accuracy": result["bid_accuracy"],
             "eval_avg_overtrick": result["avg_overtrick"],
             "eval_elo": result["elo"],
-            # New: makes it possible to see, per eval point, exactly what
-            # value curriculum advancement is being gated on.
+            # Per-cycle stage win rate, plus the cumulative/windowed rates
+            # that should_advance() actually gates on -- makes it possible
+            # to see, per eval point, exactly what value curriculum
+            # advancement is being gated on instead of just the noisier
+            # per-batch number.
             "eval_stage_win_rate": stage_wins / num_games,
-            # [FIX 2] Same TensorBoard float-only constraint as above --
-            # log the numeric index here too, not the stage name string.
+            "eval_stage_win_rate_cumulative": self.curriculum.current_stage.win_rate,
+            "eval_stage_win_rate_recent": self.curriculum.current_stage.recent_win_rate,
+            # log_scalars() forwards straight into TensorBoard's
+            # add_scalar(), which requires a float -- log the numeric stage
+            # index here too, not the stage name string.
             "curriculum_stage_idx": float(self.curriculum._current_idx),
         }
         for opp_type, wr in result["win_rates"].items():

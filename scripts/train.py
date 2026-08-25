@@ -20,7 +20,7 @@ import random
 # NOTE: I'm assuming these are the exact string keys PPOTrainer's curriculum
 # uses internally. If trainer.py names them differently (e.g. "self_play" vs
 # "selfplay"), update this list to match.
-CURRICULUM_STAGES = ["random", "mixed", "safe", "self_play"]
+CURRICULUM_STAGES = ["random", "mixed", "safe", "self_play", "mixed_self"]
 
 
 def parse_args() -> argparse.Namespace:

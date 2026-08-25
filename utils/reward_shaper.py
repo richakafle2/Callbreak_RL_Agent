@@ -6,15 +6,29 @@ Reward shaping logic for the Call Break RL agent.
 The base reward is only available at the end of each 13-trick round,
 making credit assignment difficult. Shaping adds intermediate signals
 to accelerate learning without changing the optimal policy (potential-based
-shaping guarantees policy invariance when using Φ(s') - Φ(s) form).
+shaping guarantees policy invariance when using Φ(s') - Φ(s) form, PROVIDED
+Φ(terminal) == 0 for all terminal states).
 
 Shaping components:
-  1. Trick reward     : +0.1 when a needed trick is won, -0.05 for excess tricks
-  2. Bid progress     : small positive when closing gap to bid target
-  3. Trump conservation: small negative for wasting high trumps early
+  1. Trick reward     : small positive when a needed trick is won; overtricks
+                         are reward-neutral (round_score already rewards them
+                         at the end -- see note below), except trump waste is
+                         still penalized.
+  2. Bid progress     : small negative for losing a trick that was still needed
+  3. Trump conservation: small negative for wasting high trumps on unneeded tricks
   4. Final round score: the true game reward (bid met / exceeded / failed)
+
+NOTE ON DOUBLE SHAPING:
+  trick_won_reward / trick_lost_reward and shaped_reward (potential-based) are
+  two independent per-trick shaping signals. If both are summed into the
+  agent's reward in the same step (check trainer.py / round.py), the effective
+  shaping is their SUM, and any bias in one compounds with the other. They've
+  been made directionally consistent here, but ideally only one mechanism
+  should be active at a time -- verify wiring before assuming this file alone
+  fixes the low-bid overweighting behavior.
 """
 
+import math
 from typing import List, Optional
 
 
@@ -23,32 +37,45 @@ class RewardShaper:
         self,
         enabled: bool = True,
         trick_reward: float = 0.1,
-        excess_trick_penalty: float = -0.05,
         bid_progress_bonus: float = 0.02,
         trump_waste_penalty: float = -0.03,
         overtrick_bonus_rate: float = 0.1,
         underbid_penalty_rate: float = 1.0,
+        potential_scale: float = 1.0,
+        denial_bonus: float = 0.05,
     ):
         self.enabled = enabled
         self.trick_reward = trick_reward
-        self.excess_trick_penalty = excess_trick_penalty
         self.bid_progress_bonus = bid_progress_bonus
         self.trump_waste_penalty = trump_waste_penalty
         self.overtrick_bonus_rate = overtrick_bonus_rate
         self.underbid_penalty_rate = underbid_penalty_rate
+        self.potential_scale = potential_scale
+        self.denial_bonus = denial_bonus
 
     # ------------------------------------------------------------------
     # Per-trick intermediate reward
     # ------------------------------------------------------------------
 
-    def trick_won_reward(self, tricks_won: int, bid: int, card_played=None) -> float:
+    def trick_won_reward(
+        self,
+        tricks_won: int,
+        bid: int,
+        card_played=None,
+        opponent_bids: Optional[List[int]] = None,
+        opponent_tricks_won: Optional[List[int]] = None,
+    ) -> float:
         """
         Called when the agent wins a trick.
 
         Args:
-            tricks_won : tricks won AFTER this trick (inclusive)
+            tricks_won : agent's tricks won AFTER this trick (inclusive)
             bid        : agent's declared bid
             card_played: the Card used to win (for trump waste detection)
+            opponent_bids       : each opponent's declared bid, if available
+            opponent_tricks_won : each opponent's tricks won BEFORE this
+                trick (i.e. unaffected by it, since they didn't win it) --
+                used to detect denial.
 
         Returns a shaped reward signal.
         """
@@ -58,11 +85,8 @@ class RewardShaper:
         if tricks_won <= bid:
             reward = self.trick_reward
         else:
-            # Already met the bid -- winning further tricks isn't harmful to
-            # the score (overtricks add a small bonus at round end), but we
-            # discourage the *play policy* from chasing unnecessary tricks
-            # at the cost of good cards, since that can cost tricks later.
-            reward = self.excess_trick_penalty
+            
+            reward = self.trick_reward * self.overtrick_bonus_rate 
 
         # Trump conservation: penalize using a high trump (Ace/King) to win
         # a trick that wasn't needed to reach the bid.
@@ -73,6 +97,18 @@ class RewardShaper:
             and getattr(card_played, "rank", 0) >= 13  # King (13) or Ace (14)
         ):
             reward += self.trump_waste_penalty
+
+        #
+        # This is a heuristic, not an exact counterfactual ("would this
+        # specific opponent have won the trick without my card") -- it
+        # simply rewards taking tricks away from the pool while an opponent
+        # still needs some. That's directionally correct and much cheaper
+        # than reconstructing per-trick counterfactuals from play history.
+        if opponent_bids is not None and opponent_tricks_won is not None:
+            needy_opponents = sum(
+                1 for ob, ot in zip(opponent_bids, opponent_tricks_won) if ot < ob
+            )
+            reward += self.denial_bonus * needy_opponents
 
         return reward
 
@@ -131,24 +167,45 @@ class RewardShaper:
     def potential(self, tricks_won: int, bid: int, tricks_remaining: int) -> float:
         """
         State potential Φ(s) for potential-based shaping.
-        High potential = closer to meeting bid with tricks to spare.
 
-        Φ(s) = (tricks_won / bid) * tricks_remaining_factor
+        Design goals fixed from the previous version:
+          1. Bid-invariant magnitude: winning/losing a trick should move Φ
+             by a comparable amount whether bid=1 or bid=10. The old
+             `tricks_won / bid` ratio made low-bid rounds dominate PPO's
+             advantage estimates.
+          2. Φ(terminal) == 0: required for the potential-based shaping
+             policy-invariance guarantee. The old version multiplied by
+             `progress` (-> 1.0 at the end), which left a nonzero residual
+             at the terminal state and could bias the learned policy, not
+             just accelerate learning toward the same optimum.
+
+        Φ(s) = tanh(deviation / DEVIATION_NORM) * (tricks_remaining / 13)
+
+        `expected_pace` is where the agent "should" be if progressing toward
+        its bid linearly across the round. Being ahead of pace is good
+        (positive potential), behind pace is bad, and the whole thing decays
+        to exactly 0 as tricks_remaining -> 0.
+
+        Note: a hard clip(deviation, -1, 1) was tried first but saturates
+        immediately for bid=1 (the first trick alone can hit +/-1), which
+        recreates a milder version of the original bid-skew bug. tanh gives
+        a soft squash instead of a hard cutoff, so low-bid rounds don't
+        spike to the ceiling on trick one. Some residual bid-dependence is
+        expected and appropriate here -- one trick genuinely is a bigger
+        fraction of a bid=1 round than a bid=10 round -- the goal is just to
+        avoid the previous ~1/bid blowup, not to erase that difference
+        entirely.
         """
         if bid <= 0:
             return 0.0
 
-        # Cap the ratio so a large pile of overtricks doesn't blow up the
-        # potential unboundedly -- being 2x over bid isn't twice as good as
-        # being exactly on pace.
-        pace_ratio = min(tricks_won / bid, 1.5)
+        tricks_elapsed = 13 - tricks_remaining
+        expected_pace = bid * (tricks_elapsed / 13.0)
+        deviation = tricks_won - expected_pace
 
-        # Fraction of the round completed so far: potential should carry
-        # more weight as the round progresses and the current trajectory
-        # becomes a more reliable signal of the final outcome.
-        progress = 1.0 - (tricks_remaining / 13.0)
-
-        return pace_ratio * progress
+        deviation_norm = 3.0  # tricks of deviation considered "very off pace"
+        weight = tricks_remaining / 13.0
+        return math.tanh(deviation / deviation_norm) * weight * self.potential_scale
 
     def shaped_reward(
         self,

@@ -1,16 +1,26 @@
 game:
   num_players: 4
   num_rounds: 5               # rounds per full game
-  num_tricks: 13              # tricks per round
+  num_tricks: 13               # tricks per round
   trump_suit: "spades"
   min_bid: 1
   max_bid: 13
 
 environment:
   reward_shaping: true
-  intermediate_trick_reward: 0.1
-  overtrick_bonus_rate: 0.1   # per trick above bid
-  underbid_penalty_rate: 1.0  # multiplied by bid amount
+  trick_reward: 0.1            # FIX: renamed from intermediate_trick_reward to
+                                # match RewardShaper.__init__ param name exactly.
+                                # If trainer.py builds RewardShaper(**config["environment"]),
+                                # the old key was either erroring or silently
+                                # falling back to the class default -- verify
+                                # which, since either way your configured value
+                                # was probably not taking effect.
+  bid_progress_bonus: 0.02
+  trump_waste_penalty: -0.03
+  overtrick_bonus_rate: 0.3   # per trick above bid
+  underbid_penalty_rate: 0.6  # multiplied by bid amount
+  potential_scale: 1.0         # NEW: exposed so potential-shaping magnitude
+                                # is tunable without touching reward_shaper.py
 
 model:
   encoder_type: "mlp"  # "mlp" | "transformer"
@@ -20,33 +30,56 @@ model:
   dropout: 0.1
   hidden_dim: 256
 
-  # bid_network:
-  #   hidden_dims: [128, 64]
-  #   output_dim: 13            # bid 1-13
+# bid_network:
+#   hidden_dims: [128, 64]
+#   output_dim: 13            # bid 1-13
 
-  # play_network:
-  #   hidden_dims: [256, 128]
-  #   output_dim: 52            # one logit per card (masked to legal)
+# play_network:
+#   hidden_dims: [256, 128]
+#   output_dim: 52            # one logit per card (masked to legal)
 
 ppo:
   learning_rate: 3.0e-4
-  gamma: 0.99                 # discount factor
-  gae_lambda: 0.95            # GAE lambda
-  clip_epsilon: 0.2           # PPO clip range
-  entropy_coeff: 0.01         # encourage exploration
+  lr_schedule: "linear"        # NEW: anneal 3e-4 -> ~0 over total_timesteps.
+                                # A constant LR through 10M steps and multiple
+                                # curriculum-stage transitions makes late-stage
+                                # policy updates unnecessarily large; annealing
+                                # should reduce the win-rate oscillation seen
+                                # in eval logs once past step ~650K.
+  gamma: 0.99                  # discount factor
+  gae_lambda: 0.95              # GAE lambda
+  clip_epsilon: 0.2             # PPO clip range
+  entropy_coeff: 0.01
+  entropy_coeff_final: 0.001   # NEW: anneal entropy coeff alongside LR so
+                                # exploration tapers as training progresses,
+                                # rather than staying high (and noisy) all the
+                                # way into the self_play stage.
   value_loss_coeff: 0.5
   max_grad_norm: 0.5
-  num_epochs: 4               # PPO update epochs per rollout
-  batch_size: 64
-  rollout_steps: 2048         # steps per rollout collection
+  num_epochs: 4                # PPO update epochs per rollout
+  batch_size: 4096              # FIX: was 64. With rollout_steps=2048 *
+                                # num_envs=32 = 65,536 transitions/rollout,
+                                # batch_size=64 produced ~1,024 minibatches/epoch
+                                # x 4 epochs = ~4,096 gradient steps per
+                                # rollout -- unusually high variance for PPO.
+                                # 4096 gives ~16 minibatches/epoch, closer to
+                                # typical PPO configs and should stabilize
+                                # updates. Adjust based on GPU memory.
+  rollout_steps: 2048           # steps per rollout collection
 
 training:
-  total_timesteps: 10_000_000
-  num_envs: 32                # parallel environments
-  eval_interval: 50_000       # steps between evaluations
-  save_interval: 100_000
-  checkpoint_dir: "checkpoints_mlp"
-  log_dir: "logs_mlp"
+  total_timesteps: 20_000_000
+  num_envs: 32                  # parallel environments
+  eval_interval: 65_536         # FIX: was 50_000, which doesn't align with a
+                                # rollout boundary (rollout_steps * num_envs =
+                                # 65,536 -- matches your eval log step values).
+                                # Setting this to the same number just makes
+                                # the intent explicit; purely cosmetic, but
+                                # avoids confusion about why logged steps never
+                                # actually landed on 50,000.
+  save_interval: 10_000_000
+  checkpoint_dir: "checkpoints/mlp_run_uniform_v3"
+  log_dir: "logs/mlp_run_uniform_v3"
   seed: 42
 
 curriculum:
@@ -56,18 +89,21 @@ curriculum:
       threshold_winrate: 0.70   # advance when agent wins 70% of games
     - name: "mixed"
       opponents: ["random", "safe_play", "basic_bet"]
-      threshold_winrate: 0.65
+      threshold_winrate: 0.55   
     - name: "safe"
       opponents: ["safe_play", "safe_play", "safe_play"]
       threshold_winrate: 0.60
+    - name: "mixed_self"        
+      opponents: ["basic_bet", "self", "safe_play"]
+      threshold_winrate: 0.35
     - name: "self_play"
       opponents: ["basic_bet", "self", "self"]
-      threshold_winrate: null   # run for fixed timesteps
+      threshold_winrate: null   
 
 self_play:
-  pool_size: 20               # number of past checkpoints to keep
-  sample_strategy: "uniform"  # "uniform" | "prioritized"
-  update_every: 200_000       # steps before adding current agent to pool
+  pool_size: 20                 # number of past checkpoints to keep
+  sample_strategy: "uniform"    # "uniform" | "prioritized"
+  update_every: 200_000         # steps before adding current agent to pool
 
 evaluation:
   num_games: 200
@@ -76,6 +112,8 @@ evaluation:
     - "safe_bet"
     - "safe_play"
     - "basic_bet"
-  elo:
-    initial_rating: 1000
-    k_factor: 32
+
+elo:
+  initial_rating: 1000
+  k_factor: 32
+
